@@ -10,10 +10,13 @@
 
 use std::collections::HashMap;
 use std::ffi::CString;
-use std::fmt;
+use std::io::{BufReader, BufWriter};
+use std::os::fd::AsRawFd;
 use std::path::Path;
+use std::{fmt, process};
 
 use log::{debug, error, trace, warn};
+use memfile::MemFile;
 use nix::sys::{ptrace, signal::Signal, wait::WaitStatus};
 use nix::unistd::Pid;
 
@@ -47,6 +50,10 @@ pub struct Ptracer {
     threads: HashMap<Pid, ThreadState>,
     event: WaitStatus,
     breakpoints: HashMap<ptrace::AddressType, Breakpoint>,
+
+    pub stdin: BufWriter<MemFile>,
+    pub stdout: BufReader<MemFile>,
+    pub stderr: BufReader<MemFile>,
 }
 
 impl Ptracer {
@@ -57,7 +64,7 @@ impl Ptracer {
     ///
     /// *WARNING*: Only one concurrent instance is currently supported!
     pub fn spawn(path: &Path, args: &[String]) -> nix::Result<Self> {
-        let pid = spawn(path.to_str().unwrap(), args)?;
+        let (pid, stdin, stdout, stderr) = spawn(path.to_str().unwrap(), args)?;
 
         let event = wait()?;
         debug!("Process (PID={}) spawned: {:?}", pid, event);
@@ -86,6 +93,9 @@ impl Ptracer {
             breakpoints: HashMap::new(),
             registers,
             threads,
+            stdin: BufWriter::new(stdin),
+            stdout: BufReader::new(stdout),
+            stderr: BufReader::new(stderr),
         })
     }
 
@@ -497,10 +507,40 @@ impl fmt::Debug for Ptracer {
     }
 }
 
+enum FdOverrideTarget {
+    Stdin,
+    Stdout,
+    Stderr,
+}
+
+unsafe fn redirect_fd(current: FdOverrideTarget, proc_id: u32, fd: i32) {
+    use stdio_override::{StderrOverride, StdinOverride, StdoutOverride};
+    //we forget to make changes permanent
+    let path = &format!("/proc/{proc_id}/fd/{fd}");
+    match current {
+        FdOverrideTarget::Stdin => {
+            let handle = StdinOverride::override_file(path).unwrap();
+            std::mem::forget(handle);
+        }
+        FdOverrideTarget::Stdout => {
+            let handle = StdoutOverride::override_file(path).unwrap();
+            std::mem::forget(handle);
+        }
+        FdOverrideTarget::Stderr => {
+            let handle = StderrOverride::override_file(path).unwrap();
+            std::mem::forget(handle);
+        }
+    }
+}
+
+pub type StdInFile = MemFile;
+pub type StdOutFile = MemFile;
+pub type StdErrFile = MemFile;
+
 /// Spawn a new process.
 ///
 /// Disable ASLR (linux only).
-fn spawn(path: &str, args: &[String]) -> nix::Result<Pid> {
+fn spawn(path: &str, args: &[String]) -> nix::Result<(Pid, StdInFile, StdOutFile, StdErrFile)> {
     #[cfg(any(target_os = "android", target_os = "linux"))]
     use nix::libc::personality;
     use nix::unistd::{execv, fork, ForkResult};
@@ -514,14 +554,29 @@ fn spawn(path: &str, args: &[String]) -> nix::Result<Pid> {
     let mut args = args.iter().map(|arg| arg.as_c_str()).collect::<Vec<_>>();
     args.insert(0, path.as_c_str());
 
+    let stdin = MemFile::create_default("stdin").unwrap();
+    let stdout = MemFile::create_default("stdout").unwrap();
+    let stderr = MemFile::create_default("stderr").unwrap();
+
+    let this_process = process::id();
+
     match unsafe { fork() } {
-        Ok(ForkResult::Parent { child, .. }) => Ok(child),
+        Ok(ForkResult::Parent { child, .. }) => Ok((child, stdin, stdout, stderr)),
         Ok(ForkResult::Child) => {
             ptrace::traceme()?;
             #[cfg(any(target_os = "android", target_os = "linux"))]
             unsafe {
                 personality(ADDR_NO_RANDOMIZE);
             }
+
+            //redirect all fds
+            //this may not work, but if we pray real hard...
+            unsafe {
+                redirect_fd(FdOverrideTarget::Stdin, this_process, stdin.as_raw_fd());
+                redirect_fd(FdOverrideTarget::Stdout, this_process, stdout.as_raw_fd());
+                redirect_fd(FdOverrideTarget::Stderr, this_process, stderr.as_raw_fd());
+            }
+
             execv(&path, &args)?;
             unreachable!();
         }
