@@ -1,12 +1,13 @@
 use nix::sys::wait::WaitStatus;
-use ptracer::util;
+use ptracer::{util, TracerError};
 use ptracer::{ContinueMode, Ptracer, Registers};
 use std::env;
 use std::fs::File;
 use std::io::Read;
 use std::path::Path;
+use std::process::Command;
 
-fn main() -> nix::Result<()> {
+fn main() -> Result<(), TracerError> {
     env_logger::init();
 
     if env::args().len() < 2 {
@@ -16,7 +17,10 @@ fn main() -> nix::Result<()> {
 
     let args = env::args().skip(1).collect::<Vec<_>>();
     let path = Path::new(&args[0]);
-    let ptracer = Ptracer::spawn(&path, &args[1..]);
+
+    let mut command = Command::new(&args[0]);
+    command.args(&args[1..]);
+    let ptracer = Ptracer::spawn(command, None);
     if let Err(err) = ptracer {
         return Err(err);
     }
@@ -147,5 +151,7 @@ fn main() -> nix::Result<()> {
         }
     }
 
-    ptracer.detach(None)
+    ptracer.detach(None)?;
+
+    Ok(())
 }

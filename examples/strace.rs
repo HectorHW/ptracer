@@ -3,6 +3,7 @@ use ptracer::util;
 use ptracer::{ContinueMode, Ptracer, Registers, ThreadState};
 use std::env;
 use std::path::Path;
+use std::process::Command;
 
 fn main() {
     env_logger::init();
@@ -14,7 +15,10 @@ fn main() {
 
     let args = env::args().skip(1).collect::<Vec<_>>();
     let path = Path::new(&args[0]);
-    let ptracer = Ptracer::spawn(&path, &args[1..]);
+
+    let mut command = Command::new(&args[0]);
+    command.args(&args[1..]);
+    let ptracer = Ptracer::spawn(command, None);
     if let Err(err) = ptracer {
         eprintln!("Error: {}", err);
         return;
