@@ -117,3 +117,17 @@ pub fn show_registers<R: Registers>(regs: &R) {
         regs.gs()
     );
 }
+
+#[cfg(any(target_os = "android", target_os = "linux"))]
+/// Disable ASLR on linux
+///
+/// Disables ASLR on linux by using personality syscall. Note: this only affects children
+///
+/// # Safety
+///
+/// this function is marked as unsafe because of usage of libc personality syscall
+pub unsafe fn disable_aslr() {
+    use nix::libc::personality;
+    const ADDR_NO_RANDOMIZE: nix::libc::c_ulong = 0x0040000;
+    personality(ADDR_NO_RANDOMIZE);
+}
