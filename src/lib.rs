@@ -9,14 +9,13 @@
 //! See examples for possible usage.
 
 use std::collections::HashMap;
-use std::ffi::CString;
-use std::io::{BufReader, BufWriter};
-use std::os::fd::AsRawFd;
-use std::path::Path;
-use std::{fmt, process};
+use std::fmt;
+use std::os::unix::process::CommandExt;
+use std::process::{Child, Command};
+
+use thiserror::Error;
 
 use log::{debug, error, trace, warn};
-use memfile::MemFile;
 use nix::sys::{ptrace, signal::Signal, wait::WaitStatus};
 use nix::unistd::Pid;
 
@@ -30,14 +29,18 @@ cfg_if::cfg_if! {
         pub use nix::sys::ptrace::{write, getevent, getregs, getsiginfo, read, setregs, setsiginfo};
         pub use linux::{PtraceRegisters, PtraceData};
         pub use procfs;
+        pub use util::disable_aslr;
 
-        const ADDR_NO_RANDOMIZE: nix::libc::c_ulong = 0x0040000;
+        pub type Options = ptrace::Options;
+
     } else if #[cfg(target_os = "freebsd")] {
         mod freebsd;
         use freebsd::syscall;
         pub use nix::sys::ptrace::write;
         pub use freebsd::{getregs, read, setregs};
         pub use freebsd::{PtraceRegisters, PtraceData};
+
+        pub type Options = ();
     }
 }
 
@@ -46,42 +49,38 @@ cfg_if::cfg_if! {
 /// *WARNING*: Only one concurrent instance is currently supported!
 pub struct Ptracer {
     pid: Pid,
+    child: Child,
     registers: PtraceRegisters,
     threads: HashMap<Pid, ThreadState>,
     event: WaitStatus,
     breakpoints: HashMap<ptrace::AddressType, Breakpoint>,
+}
 
-    pub stdin: BufWriter<MemFile>,
-    pub stdout: BufReader<MemFile>,
-    pub stderr: BufReader<MemFile>,
+#[derive(Error, Debug)]
+pub enum TracerError {
+    #[error("libc error")]
+    NixError(#[from] nix::Error),
+    #[error("io error")]
+    IoError(#[from] std::io::Error),
 }
 
 impl Ptracer {
     /// Spawn a new debugee.
     ///
-    /// Set ptrace options for exec/fork/exit variants.  
-    /// Disable ASLR (linux only).  
+    /// Optionally set ptrace options for exec/fork/exit variants.  
     ///
     /// *WARNING*: Only one concurrent instance is currently supported!
-    pub fn spawn(path: &Path, args: &[String]) -> nix::Result<Self> {
-        let (pid, stdin, stdout, stderr) = spawn(path.to_str().unwrap(), args)?;
+    pub fn spawn(cmd: Command, options: Option<Options>) -> Result<Self, TracerError> {
+        let child = spawn(cmd)?;
+
+        let pid = Pid::from_raw(child.id() as i32);
 
         let event = wait()?;
         debug!("Process (PID={}) spawned: {:?}", pid, event);
         assert_eq!(event.pid(), Some(pid));
 
         #[cfg(any(target_os = "android", target_os = "linux"))]
-        ptrace::setoptions(
-            pid,
-            ptrace::Options::PTRACE_O_EXITKILL
-                | ptrace::Options::PTRACE_O_TRACECLONE
-                | ptrace::Options::PTRACE_O_TRACEEXEC
-                | ptrace::Options::PTRACE_O_TRACEEXIT
-                | ptrace::Options::PTRACE_O_TRACEFORK
-                | ptrace::Options::PTRACE_O_TRACESYSGOOD
-                | ptrace::Options::PTRACE_O_TRACEVFORK
-                | ptrace::Options::PTRACE_O_TRACEVFORKDONE,
-        )?;
+        ptrace::setoptions(pid, options.unwrap_or(ptrace::Options::empty()))?;
         let registers = getregs(pid)?;
 
         let mut threads = HashMap::new();
@@ -89,13 +88,11 @@ impl Ptracer {
 
         Ok(Self {
             pid,
+            child,
             event,
             breakpoints: HashMap::new(),
             registers,
             threads,
-            stdin: BufWriter::new(stdin),
-            stdout: BufReader::new(stdout),
-            stderr: BufReader::new(stderr),
         })
     }
 
@@ -118,6 +115,14 @@ impl Ptracer {
         }
 
         Ok(())
+    }
+
+    pub fn child(&self) -> &Child {
+        &self.child
+    }
+
+    pub fn child_mut(&mut self) -> &mut Child {
+        &mut self.child
     }
 
     /// Enable a breakpoint.
@@ -513,75 +518,15 @@ enum FdOverrideTarget {
     Stderr,
 }
 
-unsafe fn redirect_fd(current: FdOverrideTarget, proc_id: u32, fd: i32) {
-    use stdio_override::{StderrOverride, StdinOverride, StdoutOverride};
-    //we forget to make changes permanent
-    let path = &format!("/proc/{proc_id}/fd/{fd}");
-    match current {
-        FdOverrideTarget::Stdin => {
-            let handle = StdinOverride::override_file(path).unwrap();
-            std::mem::forget(handle);
-        }
-        FdOverrideTarget::Stdout => {
-            let handle = StdoutOverride::override_file(path).unwrap();
-            std::mem::forget(handle);
-        }
-        FdOverrideTarget::Stderr => {
-            let handle = StderrOverride::override_file(path).unwrap();
-            std::mem::forget(handle);
-        }
-    }
-}
-
-pub type StdInFile = MemFile;
-pub type StdOutFile = MemFile;
-pub type StdErrFile = MemFile;
-
 /// Spawn a new process.
-///
-/// Disable ASLR (linux only).
-fn spawn(path: &str, args: &[String]) -> nix::Result<(Pid, StdInFile, StdOutFile, StdErrFile)> {
-    #[cfg(any(target_os = "android", target_os = "linux"))]
-    use nix::libc::personality;
-    use nix::unistd::{execv, fork, ForkResult};
+fn spawn(mut cmd: Command) -> std::io::Result<Child> {
+    unsafe {
+        cmd.pre_exec(|| {
+            ptrace::traceme().map_err(|err| std::io::Error::from_raw_os_error(err as i32))
+        })
+    };
 
-    let path = CString::new(path).expect("CString::new failed");
-
-    let args = args
-        .iter()
-        .map(|arg| CString::new(arg.as_str()).unwrap())
-        .collect::<Vec<_>>();
-    let mut args = args.iter().map(|arg| arg.as_c_str()).collect::<Vec<_>>();
-    args.insert(0, path.as_c_str());
-
-    let stdin = MemFile::create_default("stdin").unwrap();
-    let stdout = MemFile::create_default("stdout").unwrap();
-    let stderr = MemFile::create_default("stderr").unwrap();
-
-    let this_process = process::id();
-
-    match unsafe { fork() } {
-        Ok(ForkResult::Parent { child, .. }) => Ok((child, stdin, stdout, stderr)),
-        Ok(ForkResult::Child) => {
-            ptrace::traceme()?;
-            #[cfg(any(target_os = "android", target_os = "linux"))]
-            unsafe {
-                personality(ADDR_NO_RANDOMIZE);
-            }
-
-            //redirect all fds
-            //this may not work, but if we pray real hard...
-            unsafe {
-                redirect_fd(FdOverrideTarget::Stdin, this_process, stdin.as_raw_fd());
-                redirect_fd(FdOverrideTarget::Stdout, this_process, stdout.as_raw_fd());
-                redirect_fd(FdOverrideTarget::Stderr, this_process, stderr.as_raw_fd());
-            }
-
-            execv(&path, &args)?;
-            unreachable!();
-        }
-        Err(err) => Err(err),
-    }
+    cmd.spawn()
 }
 
 /// Wait for (any) child
